@@ -10,6 +10,8 @@ import FilterCarousel from "./components/FilterCarousel";
 import FinalStrip from "./components/FinalStrip";
 import ActivityHub from "./components/ActivityHub";
 import DateInvitation from "./components/DateInvitation";
+import { normalizeRoomCode } from "./lib/roomCode";
+import { createRoomRequest, joinRoomRequest, saveParticipantRequest } from "./lib/roomsApi";
 import { Camera, Heart, Plus, Calendar, ArrowRight, Share2, Clipboard, ChevronRight, User, HelpCircle, Laptop } from "lucide-react";
 
 type Screen =
@@ -33,7 +35,13 @@ export default function App() {
   // User details
   const [userName, setUserName] = useState("Mohit");
   const [partnerName, setPartnerName] = useState("Khushi");
-  const [roomCode, setRoomCode] = useState("KPNNY");
+  const [roomCode, setRoomCode] = useState("");
+  const [joinCodeInput, setJoinCodeInput] = useState("");
+  const [roomRole, setRoomRole] = useState<"solo" | "host" | "guest">("solo");
+  const [roomError, setRoomError] = useState("");
+  const [isCreatingRoom, setIsCreatingRoom] = useState(false);
+  const [isJoiningRoom, setIsJoiningRoom] = useState(false);
+  const [isSavingParticipant, setIsSavingParticipant] = useState(false);
 
   // Selection configurations (Restored from LocalStorage per PRD 25)
   const [selectedLayoutId, setSelectedLayoutId] = useState<StripLayoutId>(() => {
@@ -65,15 +73,72 @@ export default function App() {
     localStorage.setItem("datestrip_filter", selectedFilterId);
   }, [selectedFilterId]);
 
-  // Generator helper for a beautiful random room code
-  const generateCode = () => {
-    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let code = "";
-    for (let i = 0; i < 5; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
+  const handleCreateRoom = async () => {
+    setRoomError("");
+    setIsCreatingRoom(true);
+
+    try {
+      const room = await createRoomRequest();
+      setRoomRole("host");
+      setRoomCode(room.roomCode);
+      setJoinCodeInput(room.roomCode);
+      setCurrentScreen("room_code");
+    } catch (error) {
+      setRoomError(error instanceof Error ? error.message : "Unable to create a room right now.");
+    } finally {
+      setIsCreatingRoom(false);
     }
-    setRoomCode(code);
-    setCurrentScreen("room_code");
+  };
+
+  const handleJoinRoom = async () => {
+    setRoomError("");
+    setIsJoiningRoom(true);
+
+    try {
+      const room = await joinRoomRequest(joinCodeInput);
+      setRoomRole("guest");
+      setRoomCode(room.roomCode);
+      setJoinCodeInput(room.roomCode);
+      setPartnerName(room.hostName ?? "");
+      setCurrentScreen("name_input");
+    } catch (error) {
+      setRoomError(error instanceof Error ? error.message : "Unable to join that room right now.");
+    } finally {
+      setIsJoiningRoom(false);
+    }
+  };
+
+  const handleContinueFromNames = async () => {
+    if (!userName.trim()) {
+      return;
+    }
+
+    setRoomError("");
+
+    if (roomRole !== "solo" && roomCode) {
+      setIsSavingParticipant(true);
+
+      try {
+        const room = await saveParticipantRequest(roomCode, roomRole, userName);
+        setRoomCode(room.roomCode);
+
+        if (roomRole === "host" && room.guestName) {
+          setPartnerName(room.guestName);
+        }
+
+        if (roomRole === "guest" && room.hostName) {
+          setPartnerName(room.hostName);
+        }
+      } catch (error) {
+        setRoomError(error instanceof Error ? error.message : "Unable to save your room details right now.");
+        setIsSavingParticipant(false);
+        return;
+      }
+
+      setIsSavingParticipant(false);
+    }
+
+    setCurrentScreen("choose_layout");
   };
 
   const selectedLayout = LAYOUTS.find((l) => l.id === selectedLayoutId) || LAYOUTS[1];
@@ -289,8 +354,16 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-8 max-w-2xl mx-auto mb-8">
                 {/* CREATE SESSION CARD */}
                 <div
-                  onClick={generateCode}
-                  className="cursor-pointer border-2 border-zinc-200 hover:border-zinc-950 dark:border-zinc-800 dark:hover:border-zinc-200 transition-all duration-200 rounded-3xl p-8 bg-white dark:bg-zinc-900 shadow-sm flex flex-col justify-between h-[200px]"
+                  onClick={() => {
+                    if (!isCreatingRoom) {
+                      handleCreateRoom();
+                    }
+                  }}
+                  className={`border-2 rounded-3xl p-8 bg-white dark:bg-zinc-900 shadow-sm flex flex-col justify-between h-[200px] transition-all duration-200 ${
+                    isCreatingRoom
+                      ? "cursor-wait border-zinc-300 dark:border-zinc-700 opacity-80"
+                      : "cursor-pointer border-zinc-200 hover:border-zinc-950 dark:border-zinc-800 dark:hover:border-zinc-200"
+                  }`}
                 >
                   <div>
                     <h3 className="font-display font-black text-2xl text-zinc-900 dark:text-zinc-50">
@@ -318,22 +391,35 @@ export default function App() {
                   <div className="flex gap-2">
                     <input
                       type="text"
+                      value={joinCodeInput}
+                      onChange={(e) => setJoinCodeInput(normalizeRoomCode(e.target.value))}
                       placeholder="e.g. KX7RM"
                       className="w-full rounded-xl border border-zinc-300 dark:border-zinc-700 p-2.5 text-xs outline-none focus:border-zinc-900 uppercase font-mono"
                     />
                     <button
-                      onClick={() => setCurrentScreen("name_input")}
-                      className="px-4 py-2 bg-zinc-900 text-white rounded-xl text-xs font-mono cursor-pointer hover:bg-zinc-800"
+                      onClick={handleJoinRoom}
+                      disabled={isJoiningRoom}
+                      className="px-4 py-2 bg-zinc-900 text-white rounded-xl text-xs font-mono cursor-pointer hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-500"
                     >
-                      Join
+                      {isJoiningRoom ? "..." : "Join"}
                     </button>
                   </div>
+                  {roomError && (
+                    <p className="mt-3 text-[11px] font-mono text-rose-500">
+                      {roomError}
+                    </p>
+                  )}
                 </div>
               </div>
 
               <div className="text-center pt-4">
                 <button
-                  onClick={() => setCurrentScreen("name_input")}
+                  onClick={() => {
+                    setRoomRole("solo");
+                    setRoomCode("");
+                    setRoomError("");
+                    setCurrentScreen("name_input");
+                  }}
                   className="font-mono text-xs font-bold text-zinc-800 dark:text-zinc-200 hover:underline cursor-pointer"
                 >
                   or start the session now ▷
@@ -423,6 +509,11 @@ export default function App() {
                   <h3 className="font-display font-black text-2xl text-zinc-900 dark:text-zinc-50 mt-1">
                     WHO IS POSING?
                   </h3>
+                  {roomCode && roomRole !== "solo" && (
+                    <p className="mt-2 text-[11px] font-mono uppercase tracking-[0.18em] text-zinc-400">
+                      Connected to room {roomCode} as {roomRole}
+                    </p>
+                  )}
                 </div>
 
                 <div className="space-y-4">
@@ -454,16 +545,22 @@ export default function App() {
                   </div>
                 </div>
 
+                {roomError && (
+                  <p className="text-[11px] font-mono text-rose-500 text-center">
+                    {roomError}
+                  </p>
+                )}
+
                 <button
-                  onClick={() => setCurrentScreen("choose_layout")}
-                  disabled={!userName.trim()}
+                  onClick={handleContinueFromNames}
+                  disabled={!userName.trim() || isSavingParticipant}
                   className={`w-full py-3.5 rounded-xl font-display font-bold flex items-center justify-center gap-1.5 shadow-md cursor-pointer ${
-                    userName.trim()
+                    userName.trim() && !isSavingParticipant
                       ? "bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:bg-zinc-800"
                       : "bg-zinc-100 dark:bg-zinc-800 text-zinc-400 dark:text-zinc-600 cursor-not-allowed shadow-none"
                   }`}
                 >
-                  <span>ready</span>
+                  <span>{isSavingParticipant ? "syncing..." : "ready"}</span>
                   <span className="font-mono">▷</span>
                 </button>
               </div>
