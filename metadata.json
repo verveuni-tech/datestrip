@@ -1,0 +1,6 @@
+{
+  "name": "DateStrip",
+  "description": "A virtual photobooth for long-distance couples to capture, customize, and share nostalgic photo strips together.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
