@@ -1,4 +1,4 @@
-import { createRoom } from "../_lib/rooms";
+import { createRoom } from "../_lib/rooms.js";
 
 export default async function handler(request: any, response: any) {
   if (request.method !== "POST") {

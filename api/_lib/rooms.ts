@@ -1,5 +1,5 @@
 import { neon } from "@neondatabase/serverless";
-import { generateRoomCode, isValidRoomCode, normalizeRoomCode } from "../../src/lib/roomCode";
+import { generateRoomCode, isValidRoomCode, normalizeRoomCode } from "../../src/lib/roomCode.js";
 
 type RoomRow = {
   room_code: string;

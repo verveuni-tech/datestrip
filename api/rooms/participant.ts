@@ -1,4 +1,4 @@
-import { saveParticipant } from "../_lib/rooms";
+import { saveParticipant } from "../_lib/rooms.js";
 
 function readBody(request: any) {
   if (!request.body) {

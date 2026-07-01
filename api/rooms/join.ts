@@ -1,4 +1,4 @@
-import { joinRoom } from "../_lib/rooms";
+import { joinRoom } from "../_lib/rooms.js";
 
 function readBody(request: any) {
   if (!request.body) {

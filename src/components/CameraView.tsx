@@ -570,7 +570,7 @@ export default function CameraView({
         </div>
 
         {/* Live Webcam / Mock Feed Screen stage */}
-        <div className="relative flex-1 aspect-[4/3] w-full bg-black rounded-2xl overflow-hidden shadow-inner flex items-center justify-center border-4 border-zinc-200 dark:border-zinc-800">
+        <div className="relative aspect-[4/3] h-[62vh] max-h-[560px] w-auto mx-auto lg:flex-1 lg:h-auto lg:max-h-none lg:w-full bg-black rounded-2xl overflow-hidden shadow-inner flex items-center justify-center border-4 border-zinc-200 dark:border-zinc-800">
           
           {/* Grid overlay for alignment assistance */}
           {showGrid && !isCapturing && (
