@@ -3,14 +3,95 @@ import { motion, AnimatePresence } from "motion/react";
 import { CapturedPhoto, StripLayout, ThemeConfig } from "../types";
 import { THEMES } from "../data";
 import { Camera, RefreshCw, Sparkles, AlertCircle, ToggleLeft, ToggleRight, HelpCircle, Eye, Sliders, Volume2, VolumeX } from "lucide-react";
+import { startCountdownRequest, submitFrameRequest, pollRoomStateRequest } from "../lib/roomsApi";
 
 interface CameraViewProps {
   layout: StripLayout;
   theme: ThemeConfig;
   userName: string;
   partnerName: string;
+  roomCode?: string;
+  roomRole: "solo" | "host" | "guest";
   onPhotosCaptured: (photos: CapturedPhoto[]) => void;
   onBack: () => void;
+}
+
+const HALF_W = 320;
+const HALF_H = 480;
+const PARTNER_WAIT_TIMEOUT_MS = 8000;
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function computeCenteredCrop(vw: number, vh: number, ratio: number) {
+  const sourceRatio = vw / vh;
+  let cropX = 0;
+  let cropY = 0;
+  let cropW = vw;
+  let cropH = vh;
+
+  if (sourceRatio > ratio) {
+    cropW = vh * ratio;
+    cropH = vh;
+    cropX = (vw - cropW) / 2;
+    cropY = 0;
+  } else {
+    cropW = vw;
+    cropH = vw / ratio;
+    cropX = 0;
+    cropY = (vh - cropH) / 2;
+  }
+
+  return { cropX, cropY, cropW, cropH };
+}
+
+function drawMockSelfie(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  ctx.save();
+  ctx.fillStyle = "#1e1e24";
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.fillStyle = "#e11d48";
+  ctx.beginPath();
+  ctx.arc(w / 2, h * 0.62, w * 0.55, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = "#fecdd3";
+  ctx.beginPath();
+  ctx.arc(w / 2, h * 0.38, w * 0.28, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.ellipse(w / 2, h * 0.72, w * 0.42, h * 0.16, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.font = `bold ${Math.round(w * 0.18)}px sans-serif`;
+  ctx.fillStyle = "#111827";
+  ctx.textAlign = "center";
+  ctx.fillText("✨", w / 2, h * 0.34);
+  ctx.restore();
+}
+
+function drawNameTag(ctx: CanvasRenderingContext2D, x: number, name: string) {
+  ctx.save();
+  ctx.fillStyle = "rgba(17, 24, 39, 0.8)";
+  ctx.beginPath();
+  ctx.roundRect(x, 430, 100, 32, 16);
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 12px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(name, x + 50, 450);
+  ctx.restore();
+}
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Unable to load captured image."));
+    img.src = src;
+  });
 }
 
 export default function CameraView({
@@ -18,9 +99,13 @@ export default function CameraView({
   theme,
   userName,
   partnerName,
+  roomCode,
+  roomRole,
   onPhotosCaptured,
   onBack,
 }: CameraViewProps) {
+  const isConnectedSession = !!roomCode && roomRole !== "solo";
+  const mySide: "host" | "guest" = roomRole === "guest" ? "guest" : "host";
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isUsingMock, setIsUsingMock] = useState(false);
@@ -43,6 +128,22 @@ export default function CameraView({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Connected (two-device) joint session state
+  const [waitingForPartner, setWaitingForPartner] = useState(false);
+  const [partnerWaitTimedOut, setPartnerWaitTimedOut] = useState(false);
+  const cancelledRef = useRef(false);
+  const countdownTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isUsingMockRef = useRef(isUsingMock);
+  const isMirroredRef = useRef(isMirrored);
+
+  useEffect(() => {
+    isUsingMockRef.current = isUsingMock;
+  }, [isUsingMock]);
+
+  useEffect(() => {
+    isMirroredRef.current = isMirrored;
+  }, [isMirrored]);
 
   // Audio Context for sweet synthetic shutter sound
   const playShutterSound = () => {
@@ -142,6 +243,12 @@ export default function CameraView({
   // Handle start of the automated photobooth loop
   const startCaptureSequence = () => {
     if (isCapturing) return;
+
+    if (isConnectedSession) {
+      runConnectedSession();
+      return;
+    }
+
     setIsCapturing(true);
     setCaptured([]);
     capturedRef.current = [];
@@ -406,17 +513,228 @@ export default function CameraView({
   };
 
   const handleRetake = () => {
+    cancelledRef.current = true;
     if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    if (countdownTimeoutRef.current) clearTimeout(countdownTimeoutRef.current);
     setCountdown(null);
     setIsCapturing(false);
+    setWaitingForPartner(false);
+    setPartnerWaitTimedOut(false);
     setCaptured([]);
     capturedRef.current = [];
     setCurrentFrameIndex(0);
     currentFrameIndexRef.current = 0;
   };
 
+  // --- Connected (two-device) joint session capture ---
+  // Each device captures only its own half (a natural 2:3 portrait crop of its own
+  // webcam, not half of a shared 4:3 crop like the simulated solo/LDR mode above).
+  const captureOwnHalfDataUrl = (): string => {
+    const canvas = canvasRef.current!;
+    const ctx = canvas.getContext("2d")!;
+    canvas.width = HALF_W;
+    canvas.height = HALF_H;
+
+    const video = videoRef.current;
+    if (!isUsingMockRef.current && video && video.readyState >= 2) {
+      const { cropX, cropY, cropW, cropH } = computeCenteredCrop(video.videoWidth, video.videoHeight, HALF_W / HALF_H);
+      ctx.save();
+      if (isMirroredRef.current) {
+        ctx.translate(HALF_W, 0);
+        ctx.scale(-1, 1);
+      }
+      ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, HALF_W, HALF_H);
+      ctx.restore();
+    } else {
+      drawMockSelfie(ctx, HALF_W, HALF_H);
+    }
+
+    return canvas.toDataURL("image/png");
+  };
+
+  const compositeHalves = async (myUrl: string, partnerUrl: string, frameIndex: number): Promise<CapturedPhoto> => {
+    const canvas = canvasRef.current!;
+    const ctx = canvas.getContext("2d")!;
+    canvas.width = HALF_W * 2;
+    canvas.height = HALF_H;
+
+    const hostUrl = mySide === "host" ? myUrl : partnerUrl;
+    const guestUrl = mySide === "guest" ? myUrl : partnerUrl;
+    const [hostImg, guestImg] = await Promise.all([loadImage(hostUrl), loadImage(guestUrl)]);
+
+    ctx.drawImage(hostImg, 0, 0, HALF_W, HALF_H);
+    ctx.drawImage(guestImg, HALF_W, 0, HALF_W, HALF_H);
+
+    ctx.strokeStyle = "#db2777";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(HALF_W, 0);
+    ctx.lineTo(HALF_W, HALF_H);
+    ctx.stroke();
+
+    const leftName = roomRole === "host" ? userName : partnerName;
+    const rightName = roomRole === "guest" ? userName : partnerName;
+    drawNameTag(ctx, 110, leftName || "Host");
+    drawNameTag(ctx, HALF_W + 110, rightName || "Guest");
+
+    return {
+      id: `photo_${Date.now()}_${frameIndex}`,
+      url: canvas.toDataURL("image/png"),
+      timestamp: Date.now(),
+      by: "both",
+    };
+  };
+
+  const runCountdownToTarget = (targetMs: number): Promise<void> => {
+    return new Promise((resolve) => {
+      let lastAnnounced: number | null = null;
+      const tick = () => {
+        if (cancelledRef.current) {
+          resolve();
+          return;
+        }
+        const remaining = Math.ceil((targetMs - Date.now()) / 1000);
+        if (remaining > 0) {
+          if (remaining !== lastAnnounced) {
+            lastAnnounced = remaining;
+            setCountdown(remaining);
+            playCountdownBeep(remaining === 1);
+          }
+          countdownTimeoutRef.current = setTimeout(tick, 100);
+        } else {
+          setCountdown(null);
+          resolve();
+        }
+      };
+      tick();
+    });
+  };
+
+  const waitForCountdownTarget = async (frameIndex: number): Promise<number | null> => {
+    while (!cancelledRef.current) {
+      try {
+        const state = await pollRoomStateRequest(roomCode!);
+        if (state.room.status === "done") return null;
+        if (state.room.currentFrameIndex === frameIndex && state.room.countdownTarget) {
+          return new Date(state.room.countdownTarget).getTime();
+        }
+      } catch {
+        // transient poll failure; keep retrying
+      }
+      await sleep(1000);
+    }
+    return null;
+  };
+
+  const waitForPartnerHalf = async (frameIndex: number): Promise<string | null> => {
+    const partnerSide = mySide === "host" ? "guest" : "host";
+    const deadline = Date.now() + PARTNER_WAIT_TIMEOUT_MS;
+    setWaitingForPartner(true);
+    try {
+      while (Date.now() < deadline) {
+        if (cancelledRef.current) return null;
+        try {
+          const state = await pollRoomStateRequest(roomCode!);
+          const url = state.frames[frameIndex]?.[partnerSide];
+          if (url) return url;
+        } catch {
+          // transient poll failure; keep retrying
+        }
+        await sleep(1000);
+      }
+      return null;
+    } finally {
+      setWaitingForPartner(false);
+    }
+  };
+
+  const runConnectedFrame = async (frameIndex: number) => {
+    setPartnerWaitTimedOut(false);
+    currentFrameIndexRef.current = frameIndex;
+    setCurrentFrameIndex(frameIndex);
+
+    let targetMs: number;
+    if (mySide === "host") {
+      const room = await startCountdownRequest(roomCode!, frameIndex);
+      targetMs = room.countdownTarget ? new Date(room.countdownTarget).getTime() : Date.now();
+    } else {
+      const target = await waitForCountdownTarget(frameIndex);
+      if (target === null || cancelledRef.current) {
+        setIsCapturing(false);
+        return;
+      }
+      targetMs = target;
+    }
+
+    await runCountdownToTarget(targetMs);
+    if (cancelledRef.current) return;
+
+    setFlashActive(true);
+    playShutterSound();
+    setTimeout(() => setFlashActive(false), 200);
+
+    const ownHalfUrl = captureOwnHalfDataUrl();
+
+    try {
+      await submitFrameRequest(roomCode!, mySide, frameIndex, ownHalfUrl);
+    } catch (error) {
+      setCameraError(error instanceof Error ? error.message : "Unable to submit your photo right now.");
+    }
+
+    const partnerUrl = await waitForPartnerHalf(frameIndex);
+    if (cancelledRef.current) return;
+
+    if (partnerUrl === null) {
+      setPartnerWaitTimedOut(true);
+      return;
+    }
+
+    const composite = await compositeHalves(ownHalfUrl, partnerUrl, frameIndex);
+    const updatedCaptured = [...capturedRef.current, composite];
+    capturedRef.current = updatedCaptured;
+    setCaptured(updatedCaptured);
+
+    const nextIndex = frameIndex + 1;
+    if (nextIndex < layout.frames) {
+      setTimeout(() => {
+        if (!cancelledRef.current) runConnectedFrame(nextIndex);
+      }, 1800);
+    } else {
+      setTimeout(() => {
+        setIsCapturing(false);
+        onPhotosCaptured(updatedCaptured);
+      }, 1500);
+    }
+  };
+
+  const runConnectedSession = () => {
+    cancelledRef.current = false;
+    setIsCapturing(true);
+    setCaptured([]);
+    capturedRef.current = [];
+    runConnectedFrame(0);
+  };
+
+  const handleRetakeFrame = () => {
+    setPartnerWaitTimedOut(false);
+    runConnectedFrame(currentFrameIndexRef.current);
+  };
+
+  // Guest never manually starts — it follows whatever frame the host starts a countdown for.
+  useEffect(() => {
+    if (isConnectedSession && roomRole === "guest") {
+      runConnectedSession();
+    }
+
+    return () => {
+      cancelledRef.current = true;
+      if (countdownTimeoutRef.current) clearTimeout(countdownTimeoutRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
-    <div className="flex flex-col lg:flex-row items-stretch justify-center max-w-7xl mx-auto px-4 py-6 gap-8 min-h-[80vh]">
+    <div className="flex flex-col lg:flex-row items-stretch justify-center max-w-7xl mx-auto px-2 sm:px-4 py-6 gap-8 min-h-[80vh]">
       
       {/* Hidden processing canvas */}
       <canvas ref={canvasRef} className="hidden" />
@@ -508,7 +826,7 @@ export default function CameraView({
       </div>
 
       {/* RIGHT COLUMN: LIVE CAMERA & CONTROLS */}
-      <div className="flex-1 flex flex-col justify-between bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-3xl p-6 relative overflow-hidden">
+      <div className="flex-1 flex flex-col justify-between bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-3xl p-2.5 sm:p-6 relative overflow-hidden">
         
         {/* Shutter flash screen */}
         <AnimatePresence>
@@ -526,7 +844,11 @@ export default function CameraView({
         <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <div className="flex items-center gap-3">
             <h3 className="font-display font-bold text-lg text-zinc-950 dark:text-zinc-50">
-              {isLdrMode ? "LDR Collaborative Booth" : "Solo Photobooth"}
+              {isConnectedSession
+                ? `Joint Booth · You're ${mySide === "host" ? "Left" : "Right"}`
+                : isLdrMode
+                ? "LDR Collaborative Booth"
+                : "Solo Photobooth"}
             </h3>
             <span className="text-xs font-mono bg-rose-100 dark:bg-rose-950/40 text-rose-600 dark:text-rose-400 px-2.5 py-0.5 rounded-full font-semibold">
               Frame {currentFrameIndex + 1} / {layout.frames}
@@ -534,18 +856,20 @@ export default function CameraView({
           </div>
 
           <div className="flex items-center gap-2">
-            {/* LDR Mode toggle switch */}
-            <button
-              onClick={() => !isCapturing && setIsLdrMode(!isLdrMode)}
-              disabled={isCapturing}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
-                isLdrMode
-                  ? "bg-rose-50 dark:bg-rose-950/20 text-rose-600 dark:text-rose-400 border-rose-200"
-                  : "bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400"
-              }`}
-            >
-              <span>{isLdrMode ? `🌸 Pose with ${partnerName || "Khushi"}` : "👤 Solo Capture"}</span>
-            </button>
+            {/* LDR Mode toggle switch (only for the simulated single-device mode) */}
+            {!isConnectedSession && (
+              <button
+                onClick={() => !isCapturing && setIsLdrMode(!isLdrMode)}
+                disabled={isCapturing}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
+                  isLdrMode
+                    ? "bg-rose-50 dark:bg-rose-950/20 text-rose-600 dark:text-rose-400 border-rose-200"
+                    : "bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400"
+                }`}
+              >
+                <span>{isLdrMode ? `🌸 Pose with ${partnerName || "Khushi"}` : "👤 Solo Capture"}</span>
+              </button>
+            )}
 
             {/* Mirror Cam Toggle */}
             {!isUsingMock && (
@@ -570,7 +894,7 @@ export default function CameraView({
         </div>
 
         {/* Live Webcam / Mock Feed Screen stage */}
-        <div className="relative aspect-[4/3] h-[62vh] max-h-[560px] w-auto mx-auto lg:flex-1 lg:h-auto lg:max-h-none lg:w-full bg-black rounded-2xl overflow-hidden shadow-inner flex items-center justify-center border-4 border-zinc-200 dark:border-zinc-800">
+        <div className="relative aspect-[4/3] w-full bg-black rounded-2xl overflow-hidden shadow-inner flex items-center justify-center border-2 sm:border-4 border-zinc-200 dark:border-zinc-800">
           
           {/* Grid overlay for alignment assistance */}
           {showGrid && !isCapturing && (
@@ -587,13 +911,46 @@ export default function CameraView({
             </div>
           )}
 
-          {/* LDR Split line indicator */}
-          {isLdrMode && (
+          {/* LDR Split line indicator (simulated single-device mode only) */}
+          {!isConnectedSession && isLdrMode && (
             <div className="absolute top-0 bottom-0 left-1/2 w-0.5 bg-rose-500/50 dashed z-20 pointer-events-none" />
           )}
 
-          {/* Camera Access Request / Fallback Display */}
-          {isUsingMock ? (
+          {/* Connected joint session: each device shows only its own live feed */}
+          {isConnectedSession ? (
+            <div className="w-full h-full relative">
+              {isUsingMock ? (
+                <div className="absolute inset-0 bg-zinc-950 flex flex-col items-center justify-center text-white">
+                  <div className="text-4xl animate-bounce mb-2">{mySide === "host" ? "👦" : "👧"}</div>
+                  <span className="font-mono text-[10px] text-zinc-500">Mocking Your Cam</span>
+                </div>
+              ) : (
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className={`w-full h-full object-cover ${isMirrored ? "scale-x-[-1]" : ""}`}
+                />
+              )}
+
+              <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-zinc-950/70 backdrop-blur-sm rounded-xl px-4 py-2 text-center max-w-[90%]">
+                {waitingForPartner ? (
+                  <span className="text-xs text-white font-medium">
+                    Waiting for {partnerName || "your partner"} to capture...
+                  </span>
+                ) : partnerWaitTimedOut ? (
+                  <span className="text-xs text-amber-300 font-medium">
+                    {partnerName || "Your partner"} hasn't captured this frame yet.
+                  </span>
+                ) : (
+                  <span className="text-xs text-white/80 font-mono">
+                    You're on the {mySide === "host" ? "left" : "right"} side of the strip
+                  </span>
+                )}
+              </div>
+            </div>
+          ) : isUsingMock ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-4">
               <div className="grid grid-cols-2 h-full w-full">
                 {/* Left Side: Mock User Feed */}
@@ -723,7 +1080,21 @@ export default function CameraView({
             ← Themes
           </button>
 
-          {!isCapturing ? (
+          {isConnectedSession && partnerWaitTimedOut ? (
+            <motion.button
+              whileHover={{ scale: 1.04 }}
+              whileTap={{ scale: 0.96 }}
+              onClick={handleRetakeFrame}
+              className="w-full sm:w-auto flex items-center justify-center gap-2 px-10 py-3.5 bg-amber-500 hover:bg-amber-600 text-white font-display font-bold rounded-xl shadow-lg transition-all cursor-pointer"
+            >
+              <Camera className="w-5 h-5" />
+              <span>Retake This Frame</span>
+            </motion.button>
+          ) : isConnectedSession && roomRole === "guest" ? (
+            <div className="w-full sm:w-auto px-8 py-3.5 text-center font-mono text-xs text-zinc-400">
+              {isCapturing ? "Following the shared countdown..." : "Waiting for host to start..."}
+            </div>
+          ) : !isCapturing ? (
             <motion.button
               whileHover={{ scale: 1.04 }}
               whileTap={{ scale: 0.96 }}

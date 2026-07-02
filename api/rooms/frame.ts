@@ -1,0 +1,32 @@
+import { submitFrame } from "../_lib/rooms.js";
+
+function readBody(request: any) {
+  if (!request.body) {
+    return {};
+  }
+
+  if (typeof request.body === "string") {
+    return JSON.parse(request.body);
+  }
+
+  return request.body;
+}
+
+export default async function handler(request: any, response: any) {
+  if (request.method !== "POST") {
+    response.status(405).json({ error: "Method not allowed." });
+    return;
+  }
+
+  try {
+    const body = readBody(request);
+    const side = body.side === "guest" ? "guest" : "host";
+    const frameIndex = Number(body.frameIndex);
+    await submitFrame(body.roomCode ?? "", side, frameIndex, body.photoDataUrl ?? "");
+    response.status(200).json({ ok: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to submit the frame right now.";
+    const statusCode = message.includes("must be") || message.includes("valid 5-character") ? 400 : 500;
+    response.status(statusCode).json({ error: message });
+  }
+}

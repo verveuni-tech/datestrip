@@ -11,7 +11,13 @@ import FinalStrip from "./components/FinalStrip";
 import ActivityHub from "./components/ActivityHub";
 import DateInvitation from "./components/DateInvitation";
 import { normalizeRoomCode } from "./lib/roomCode";
-import { createRoomRequest, joinRoomRequest, saveParticipantRequest } from "./lib/roomsApi";
+import {
+  createRoomRequest,
+  joinRoomRequest,
+  saveParticipantRequest,
+  configureRoomRequest,
+  pollRoomStateRequest,
+} from "./lib/roomsApi";
 import { Camera, Heart, Plus, Calendar, ArrowRight, Share2, Clipboard, ChevronRight, User, HelpCircle, Laptop } from "lucide-react";
 
 type Screen =
@@ -19,6 +25,7 @@ type Screen =
   | "booth_setup"
   | "room_code"
   | "name_input"
+  | "waiting_for_host"
   | "choose_layout"
   | "choose_theme"
   | "camera"
@@ -138,8 +145,66 @@ export default function App() {
       setIsSavingParticipant(false);
     }
 
-    setCurrentScreen("choose_layout");
+    if (roomRole === "guest") {
+      setCurrentScreen("waiting_for_host");
+    } else {
+      setCurrentScreen("choose_layout");
+    }
   };
+
+  const [isConfiguringRoom, setIsConfiguringRoom] = useState(false);
+
+  const handleThemeNext = async () => {
+    if (roomRole !== "host" || !roomCode) {
+      setCurrentScreen("camera");
+      return;
+    }
+
+    setRoomError("");
+    setIsConfiguringRoom(true);
+
+    try {
+      await configureRoomRequest(roomCode, selectedLayoutId, selectedThemeId);
+      setCurrentScreen("camera");
+    } catch (error) {
+      setRoomError(error instanceof Error ? error.message : "Unable to start the joint session right now.");
+    } finally {
+      setIsConfiguringRoom(false);
+    }
+  };
+
+  // Guest waits here until the host has chosen a layout + theme, then adopts them and jumps to camera.
+  useEffect(() => {
+    if (currentScreen !== "waiting_for_host" || roomRole !== "guest" || !roomCode) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const state = await pollRoomStateRequest(roomCode);
+
+        if (cancelled) return;
+
+        if (state.room.layoutId && state.room.themeId) {
+          setSelectedLayoutId(state.room.layoutId as StripLayoutId);
+          setSelectedThemeId(state.room.themeId as ThemeId);
+          setCurrentScreen("camera");
+        }
+      } catch {
+        // Transient poll failure; the interval will retry.
+      }
+    };
+
+    poll();
+    const intervalId = setInterval(poll, 1500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [currentScreen, roomRole, roomCode]);
 
   const selectedLayout = LAYOUTS.find((l) => l.id === selectedLayoutId) || LAYOUTS[1];
   const selectedTheme = THEMES.find((t) => t.id === selectedThemeId) || THEMES[0];
@@ -567,6 +632,40 @@ export default function App() {
             </motion.div>
           )}
 
+          {/* 4b. GUEST: WAITING FOR HOST TO CONFIGURE THE SHARED STRIP */}
+          {currentScreen === "waiting_for_host" && (
+            <motion.div
+              key="waiting_for_host"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="max-w-md mx-auto px-6 py-12 text-center"
+            >
+              <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 p-8 rounded-3xl shadow-xl space-y-5">
+                <div className="flex items-center justify-center gap-2 text-xs font-mono text-zinc-400">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                  <span>waiting for {partnerName || "your partner"}...</span>
+                </div>
+                <h3 className="font-display font-black text-2xl text-zinc-900 dark:text-zinc-50">
+                  Getting the booth ready
+                </h3>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono leading-relaxed">
+                  {partnerName || "Your partner"} is picking the strip layout and theme. You'll join the
+                  same camera session automatically once it's ready.
+                </p>
+                {roomError && (
+                  <p className="text-[11px] font-mono text-rose-500">{roomError}</p>
+                )}
+                <button
+                  onClick={() => setCurrentScreen("name_input")}
+                  className="font-mono text-xs text-zinc-400 hover:underline cursor-pointer"
+                >
+                  ← back
+                </button>
+              </div>
+            </motion.div>
+          )}
+
           {/* 5. STEP 1: SELECT LAYOUT */}
           {currentScreen === "choose_layout" && (
             <motion.div
@@ -594,9 +693,15 @@ export default function App() {
               <ThemeSelector
                 selectedThemeId={selectedThemeId}
                 onSelectTheme={setSelectedThemeId}
-                onNext={() => setCurrentScreen("camera")}
+                onNext={handleThemeNext}
                 onBack={() => setCurrentScreen("choose_layout")}
               />
+              {isConfiguringRoom && (
+                <p className="text-center text-xs font-mono text-zinc-400 mt-4">syncing with partner...</p>
+              )}
+              {roomError && (
+                <p className="text-center text-xs font-mono text-rose-500 mt-2">{roomError}</p>
+              )}
             </motion.div>
           )}
 
@@ -613,11 +718,13 @@ export default function App() {
                 theme={selectedTheme}
                 userName={userName}
                 partnerName={partnerName}
+                roomCode={roomRole === "solo" ? undefined : roomCode}
+                roomRole={roomRole}
                 onPhotosCaptured={(photos) => {
                   setCapturedPhotos(photos);
                   setCurrentScreen("arrange");
                 }}
-                onBack={() => setCurrentScreen("choose_theme")}
+                onBack={() => setCurrentScreen(roomRole === "guest" ? "waiting_for_host" : "choose_theme")}
               />
             </motion.div>
           )}

@@ -7,10 +7,22 @@ export type SharedRoom = {
   createdAt: string;
   updatedAt: string;
   lastJoinedAt: string | null;
+  layoutId: string | null;
+  themeId: string | null;
+  status: "lobby" | "capturing" | "done";
+  currentFrameIndex: number;
+  countdownTarget: string | null;
 };
+
+export type RoomFrames = Record<number, { host?: string; guest?: string }>;
 
 type RoomResponse = {
   room: SharedRoom;
+};
+
+type RoomStateResponse = {
+  room: SharedRoom;
+  frames: RoomFrames;
 };
 
 async function readRoomResponse(response: Response) {
@@ -69,4 +81,72 @@ export async function saveParticipantRequest(roomCode: string, role: "host" | "g
   });
 
   return readRoomResponse(response);
+}
+
+export async function configureRoomRequest(roomCode: string, layoutId: string, themeId: string) {
+  const response = await fetch("/api/rooms/configure", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      roomCode: normalizeRoomCode(roomCode),
+      layoutId,
+      themeId,
+    }),
+  });
+
+  return readRoomResponse(response);
+}
+
+export async function startCountdownRequest(roomCode: string, frameIndex: number) {
+  const response = await fetch("/api/rooms/countdown", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      roomCode: normalizeRoomCode(roomCode),
+      frameIndex,
+    }),
+  });
+
+  return readRoomResponse(response);
+}
+
+export async function submitFrameRequest(
+  roomCode: string,
+  side: "host" | "guest",
+  frameIndex: number,
+  photoDataUrl: string
+) {
+  const response = await fetch("/api/rooms/frame", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      roomCode: normalizeRoomCode(roomCode),
+      side,
+      frameIndex,
+      photoDataUrl,
+    }),
+  });
+
+  const payload = (await response.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
+
+  if (!response.ok || !payload || !payload.ok) {
+    throw new Error(payload && payload.error ? payload.error : "Unable to submit the frame right now.");
+  }
+}
+
+export async function pollRoomStateRequest(roomCode: string): Promise<RoomStateResponse> {
+  const response = await fetch(`/api/rooms/state?code=${encodeURIComponent(normalizeRoomCode(roomCode))}`);
+  const payload = (await response.json().catch(() => null)) as RoomStateResponse | { error?: string } | null;
+
+  if (!response.ok || !payload || !("room" in payload)) {
+    throw new Error(payload && "error" in payload && payload.error ? payload.error : "Unable to fetch room state right now.");
+  }
+
+  return payload;
 }
