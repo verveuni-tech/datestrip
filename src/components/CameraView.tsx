@@ -4,6 +4,7 @@ import { CapturedPhoto, StripLayout, ThemeConfig } from "../types";
 import { THEMES } from "../data";
 import { Camera, RefreshCw, Sparkles, AlertCircle, ToggleLeft, ToggleRight, HelpCircle, Eye, Sliders, Volume2, VolumeX } from "lucide-react";
 import { startCountdownRequest, submitFrameRequest, pollRoomStateRequest } from "../lib/roomsApi";
+import Pusher from "pusher-js";
 
 interface CameraViewProps {
   layout: StripLayout;
@@ -136,6 +137,34 @@ export default function CameraView({
   const countdownTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isUsingMockRef = useRef(isUsingMock);
   const isMirroredRef = useRef(isMirrored);
+
+  // Countdown signal pushed via Pusher (if configured) so both devices learn the
+  // target the instant the host sets it, instead of waiting for the next poll
+  // tick. Purely a latency optimization — waitForCountdownTarget still falls
+  // back to polling /api/rooms/state if this never arrives (Pusher unset, or
+  // the push is dropped).
+  const pushedCountdownRef = useRef<{ frameIndex: number; countdownTarget: string } | null>(null);
+
+  useEffect(() => {
+    const key = import.meta.env.VITE_PUSHER_KEY as string | undefined;
+    const cluster = import.meta.env.VITE_PUSHER_CLUSTER as string | undefined;
+
+    if (!isConnectedSession || !roomCode || !key || !cluster) {
+      return;
+    }
+
+    const pusher = new Pusher(key, { cluster });
+    const channel = pusher.subscribe(`room-${roomCode}`);
+    channel.bind("countdown", (data: { frameIndex: number; countdownTarget: string }) => {
+      pushedCountdownRef.current = data;
+    });
+
+    return () => {
+      channel.unbind_all();
+      pusher.unsubscribe(`room-${roomCode}`);
+      pusher.disconnect();
+    };
+  }, [isConnectedSession, roomCode]);
 
   useEffect(() => {
     isUsingMockRef.current = isUsingMock;
@@ -611,17 +640,30 @@ export default function CameraView({
   };
 
   const waitForCountdownTarget = async (frameIndex: number): Promise<number | null> => {
+    let lastPolledAt = 0;
+
     while (!cancelledRef.current) {
-      try {
-        const state = await pollRoomStateRequest(roomCode!);
-        if (state.room.status === "done") return null;
-        if (state.room.currentFrameIndex === frameIndex && state.room.countdownTarget) {
-          return new Date(state.room.countdownTarget).getTime();
-        }
-      } catch {
-        // transient poll failure; keep retrying
+      const pushed = pushedCountdownRef.current;
+      if (pushed && pushed.frameIndex === frameIndex) {
+        return new Date(pushed.countdownTarget).getTime();
       }
-      await sleep(1000);
+
+      // Cheap local check every 150ms so a push is picked up almost instantly,
+      // but only hit the network poll once a second (same cadence as before).
+      if (Date.now() - lastPolledAt >= 1000) {
+        lastPolledAt = Date.now();
+        try {
+          const state = await pollRoomStateRequest(roomCode!);
+          if (state.room.status === "done") return null;
+          if (state.room.currentFrameIndex === frameIndex && state.room.countdownTarget) {
+            return new Date(state.room.countdownTarget).getTime();
+          }
+        } catch {
+          // transient poll failure; keep retrying
+        }
+      }
+
+      await sleep(150);
     }
     return null;
   };

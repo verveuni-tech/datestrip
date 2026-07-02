@@ -1,7 +1,8 @@
 import { neon } from "@neondatabase/serverless";
 import { generateRoomCode, isValidRoomCode, normalizeRoomCode } from "../../src/lib/roomCode.js";
+import { publishCountdown } from "./pusher.js";
 
-const COUNTDOWN_LEAD_MS = 4000;
+const COUNTDOWN_LEAD_MS = 5000;
 
 type RoomRow = {
   room_code: string;
@@ -98,11 +99,14 @@ async function ensureSchema() {
         )
       `;
 
-      await sql`ALTER TABLE photobooth_rooms ADD COLUMN IF NOT EXISTS layout_id TEXT`;
-      await sql`ALTER TABLE photobooth_rooms ADD COLUMN IF NOT EXISTS theme_id TEXT`;
-      await sql`ALTER TABLE photobooth_rooms ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'lobby'`;
-      await sql`ALTER TABLE photobooth_rooms ADD COLUMN IF NOT EXISTS current_frame_index INT NOT NULL DEFAULT 0`;
-      await sql`ALTER TABLE photobooth_rooms ADD COLUMN IF NOT EXISTS countdown_target TIMESTAMPTZ`;
+      await sql`
+        ALTER TABLE photobooth_rooms
+          ADD COLUMN IF NOT EXISTS layout_id TEXT,
+          ADD COLUMN IF NOT EXISTS theme_id TEXT,
+          ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'lobby',
+          ADD COLUMN IF NOT EXISTS current_frame_index INT NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS countdown_target TIMESTAMPTZ
+      `;
 
       await sql`
         CREATE TABLE IF NOT EXISTS photobooth_frames (
@@ -206,7 +210,9 @@ export async function configureRoom(roomCode: string, layoutId: string, themeId:
     throw new Error("layoutId and themeId are required.");
   }
 
-  await ensureSchema();
+  // No ensureSchema() here: by the time a room can be configured, createRoom
+  // already ran ensureSchema() once for this database. Re-checking on every
+  // hot-path call adds latency variance that shows up as capture-sync jitter.
   const sql = getSql();
   const rows = (await sql`
     UPDATE photobooth_rooms
@@ -229,7 +235,6 @@ export async function startCountdown(roomCode: string, frameIndex: number) {
     throw new Error("frameIndex must be a non-negative integer.");
   }
 
-  await ensureSchema();
   const sql = getSql();
   const rows = (await sql`
     UPDATE photobooth_rooms
@@ -246,7 +251,16 @@ export async function startCountdown(roomCode: string, frameIndex: number) {
     throw new Error("This room no longer exists.");
   }
 
-  return mapRoom(rows[0]);
+  const room = mapRoom(rows[0]);
+
+  if (room.countdownTarget) {
+    // Best-effort push so both devices can learn the target the instant it's set,
+    // instead of waiting for their next ~1s state-poll tick. Poll is still the
+    // fallback of record if Pusher isn't configured or the push fails.
+    await publishCountdown(normalizedRoomCode, frameIndex, room.countdownTarget);
+  }
+
+  return room;
 }
 
 export async function markRoomDone(roomCode: string) {
@@ -279,7 +293,6 @@ export async function submitFrame(roomCode: string, side: "host" | "guest", fram
     throw new Error("photoDataUrl must be an image data URL.");
   }
 
-  await ensureSchema();
   const sql = getSql();
 
   await sql`
@@ -293,7 +306,6 @@ export async function submitFrame(roomCode: string, side: "host" | "guest", fram
 export async function getRoomState(roomCode: string): Promise<RoomState> {
   const normalizedRoomCode = assertValidRoomCode(roomCode);
 
-  await ensureSchema();
   const sql = getSql();
 
   const rooms = (await sql`

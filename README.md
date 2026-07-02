@@ -17,5 +17,6 @@ View your app in AI Studio: https://ai.studio/apps/cc2bee05-4bce-4585-a997-dbef3
    `npm install`
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Set the `DATABASE_URL` in `.env.local` to your Neon Postgres connection string if you want shared photobooth room creation/joining
-4. Run the app:
+4. Optional: set `PUSHER_APP_ID` / `PUSHER_KEY` / `PUSHER_SECRET` / `PUSHER_CLUSTER` (and matching `VITE_PUSHER_KEY` / `VITE_PUSHER_CLUSTER`) from a free [Pusher Channels](https://pusher.com/channels) app for instant countdown sync in joint capture sessions. Without these, joint capture still works correctly via polling, just with a bit more lag on the first countdown tick.
+5. Run the app:
    `npm run dev`
